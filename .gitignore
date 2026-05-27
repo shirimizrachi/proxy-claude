@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Environment variables
+.env
+.env.local
+
+# Lock files (yarn/pnpm — package-lock.json is tracked intentionally)
+yarn.lock
+pnpm-lock.yaml
+
+# Internal / Microsoft-specific config
+.config/tsaoptions.json
+.npmrc
+azurepipelines-coverage.yml
+
+# Reference source code (third-party)
+docs/REFERENCE-SOURCE.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data
+*.pid
+*.seed
+*.pid.lock
+
+# Temporary files
+tmp/
+temp/
+tmpclaude-*
+nul
