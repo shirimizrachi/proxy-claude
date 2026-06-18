@@ -2,7 +2,13 @@ import { describe, it, afterEach } from "node:test"
 import assert from "node:assert/strict"
 import http from "node:http"
 
+// Ensure ambient env vars (e.g. PROXY_CLAUDE_MIN_EFFORT from user settings)
+// don't leak into test expectations.
+delete process.env.PROXY_CLAUDE_MIN_EFFORT
+
 import { startServer } from "../src/server.ts"
+import type { ModelConfig } from "../src/translate.ts"
+import type { ModelSupports, TelemetryEvent } from "../src/types.ts"
 
 const TEST_NONCE = "test-nonce-12345"
 const TEST_TOKEN = "copilot-token-abc"
@@ -126,6 +132,12 @@ describe("proxy server", () => {
       req: http.IncomingMessage,
       res: http.ServerResponse,
     ) => void,
+    extras?: {
+      getModelConfig?: () => ModelConfig
+      getModelCapabilities?: (id: string) => ModelSupports | undefined
+      onTelemetry?: (event: TelemetryEvent) => void
+      resolveAlias?: (alias: string) => string | undefined
+    },
   ) {
     let mockUrl = "http://127.0.0.1:1" // unused fallback
 
@@ -135,12 +147,16 @@ describe("proxy server", () => {
       mockUrl = mock.url
     }
 
-    const { server, port } = await startServer(
-      0,
-      TEST_NONCE,
-      () => TEST_TOKEN,
-      () => mockUrl,
-    )
+    const { server, port } = await startServer({
+      port: 0,
+      nonce: TEST_NONCE,
+      getCopilotToken: () => TEST_TOKEN,
+      getCopilotBaseUrl: () => mockUrl,
+      getModelConfig: extras?.getModelConfig,
+      getModelCapabilities: extras?.getModelCapabilities,
+      onTelemetry: extras?.onTelemetry,
+      resolveAlias: extras?.resolveAlias,
+    })
     servers.push(server)
     return { port, mockUrl }
   }
@@ -746,5 +762,481 @@ describe("proxy server", () => {
 
     // Verify authorization header forwarded
     assert.ok(receivedHeaders.authorization?.startsWith("Bearer "))
+  })
+
+  // ── Effort passthrough end-to-end ────────────────────────────────────────
+
+  it("forwards output_config.effort to upstream as reasoning_effort (passthrough)", async () => {
+    let receivedBody = ""
+    const { port } = await setup(
+      (req, res) => {
+        if (req.url === "/chat/completions") {
+          let body = ""
+          req.on("data", (c: Buffer) => { body += c.toString() })
+          req.on("end", () => {
+            receivedBody = body
+            res.writeHead(200, { "Content-Type": "application/json" })
+            res.end(JSON.stringify({
+              id: "x", object: "chat.completion", created: 0, model: "claude-sonnet-4.6",
+              choices: [{
+                index: 0,
+                message: { role: "assistant", content: "ok" },
+                finish_reason: "stop",
+              }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }))
+          })
+        }
+      },
+      {
+        getModelConfig: () => ({
+          primary: "claude-sonnet-4.6",
+          sonnet: "claude-sonnet-4.6",
+          haiku: "claude-sonnet-4.6",
+          smallFast: "claude-sonnet-4.6",
+        }),
+        getModelCapabilities: (id) =>
+          id === "claude-sonnet-4.6"
+            ? { reasoning_effort: ["low", "medium", "high"] }
+            : undefined,
+      },
+    )
+
+    await request(
+      port,
+      "POST",
+      "/v1/messages",
+      JSON.stringify({
+        model: "claude-sonnet-4.6",
+        max_tokens: 50,
+        messages: [{ role: "user", content: "hi" }],
+        output_config: { effort: "medium" },
+      }),
+      { "x-api-key": TEST_NONCE },
+    )
+
+    const parsed = JSON.parse(receivedBody)
+    assert.equal(parsed.reasoning_effort, "medium")
+  })
+
+  it("clamps effort to the mapped model's ceiling (max → high)", async () => {
+    let receivedBody = ""
+    const { port } = await setup(
+      (req, res) => {
+        if (req.url === "/chat/completions") {
+          let body = ""
+          req.on("data", (c: Buffer) => { body += c.toString() })
+          req.on("end", () => {
+            receivedBody = body
+            res.writeHead(200, { "Content-Type": "application/json" })
+            res.end(JSON.stringify({
+              id: "x", object: "chat.completion", created: 0, model: "claude-sonnet-4.6",
+              choices: [{
+                index: 0,
+                message: { role: "assistant", content: "ok" },
+                finish_reason: "stop",
+              }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }))
+          })
+        }
+      },
+      {
+        getModelConfig: () => ({
+          primary: "claude-sonnet-4.6",
+          sonnet: "claude-sonnet-4.6",
+          haiku: "claude-sonnet-4.6",
+          smallFast: "claude-sonnet-4.6",
+        }),
+        getModelCapabilities: (id) =>
+          id === "claude-sonnet-4.6"
+            ? { reasoning_effort: ["low", "medium", "high"] }
+            : undefined,
+      },
+    )
+
+    await request(
+      port,
+      "POST",
+      "/v1/messages",
+      JSON.stringify({
+        model: "claude-sonnet-4.6",
+        max_tokens: 50,
+        messages: [{ role: "user", content: "hi" }],
+        output_config: { effort: "max" },
+      }),
+      { "x-api-key": TEST_NONCE },
+    )
+
+    const parsed = JSON.parse(receivedBody)
+    assert.equal(parsed.reasoning_effort, "high")
+  })
+
+  it("looks up capabilities by the MAPPED GHCP model id (tier name → mapped id)", async () => {
+    let receivedBody = ""
+    const { port } = await setup(
+      (req, res) => {
+        if (req.url === "/chat/completions") {
+          let body = ""
+          req.on("data", (c: Buffer) => { body += c.toString() })
+          req.on("end", () => {
+            receivedBody = body
+            res.writeHead(200, { "Content-Type": "application/json" })
+            res.end(JSON.stringify({
+              id: "x", object: "chat.completion", created: 0, model: "claude-opus-4.7-1m-internal",
+              choices: [{
+                index: 0,
+                message: { role: "assistant", content: "ok" },
+                finish_reason: "stop",
+              }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }))
+          })
+        }
+      },
+      {
+        getModelConfig: () => ({
+          primary: "claude-opus-4.7-1m-internal",
+          sonnet: "claude-sonnet-4.6",
+          haiku: "claude-haiku-4.5",
+          smallFast: "claude-haiku-4.5",
+        }),
+        // Capabilities only registered under the MAPPED ids, not the tier names.
+        getModelCapabilities: (id) => {
+          if (id === "claude-opus-4.7-1m-internal") {
+            return { reasoning_effort: ["low", "medium", "high", "xhigh"] }
+          }
+          return undefined
+        },
+      },
+    )
+
+    // Send the tier name "opus" — main.ts maps this to claude-opus-4.7-1m-internal
+    // via modelConfig.primary, and capabilities for the mapped id apply.
+    await request(
+      port,
+      "POST",
+      "/v1/messages",
+      JSON.stringify({
+        model: "opus",
+        max_tokens: 50,
+        messages: [{ role: "user", content: "hi" }],
+        output_config: { effort: "max" },
+      }),
+      { "x-api-key": TEST_NONCE },
+    )
+
+    const parsed = JSON.parse(receivedBody)
+    assert.equal(parsed.model, "claude-opus-4.7-1m-internal")
+    assert.equal(parsed.reasoning_effort, "xhigh")
+  })
+
+  it("drops effort silently when the request omits output_config", async () => {
+    let receivedBody = ""
+    const { port } = await setup(
+      (req, res) => {
+        if (req.url === "/chat/completions") {
+          let body = ""
+          req.on("data", (c: Buffer) => { body += c.toString() })
+          req.on("end", () => {
+            receivedBody = body
+            res.writeHead(200, { "Content-Type": "application/json" })
+            res.end(JSON.stringify({
+              id: "x", object: "chat.completion", created: 0, model: "claude-sonnet-4.6",
+              choices: [{
+                index: 0,
+                message: { role: "assistant", content: "ok" },
+                finish_reason: "stop",
+              }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }))
+          })
+        }
+      },
+      {
+        getModelCapabilities: () => ({ reasoning_effort: ["low", "medium", "high"] }),
+      },
+    )
+
+    await request(
+      port,
+      "POST",
+      "/v1/messages",
+      JSON.stringify({
+        model: "claude-sonnet-4.6",
+        max_tokens: 50,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+      { "x-api-key": TEST_NONCE },
+    )
+
+    const parsed = JSON.parse(receivedBody)
+    assert.equal(parsed.reasoning_effort, undefined)
+  })
+
+  // ── Effort recorded in telemetry ─────────────────────────────────────────
+
+  it("records requestedEffort and sentEffort on the telemetry event (with clamping)", async () => {
+    const captured: TelemetryEvent[] = []
+    const { port } = await setup(
+      (req, res) => {
+        if (req.url === "/chat/completions") {
+          let body = ""
+          req.on("data", (c: Buffer) => { body += c.toString() })
+          req.on("end", () => {
+            res.writeHead(200, { "Content-Type": "application/json" })
+            res.end(JSON.stringify({
+              id: "x", object: "chat.completion", created: 0, model: "claude-sonnet-4.6",
+              choices: [{
+                index: 0,
+                message: { role: "assistant", content: "ok" },
+                finish_reason: "stop",
+              }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }))
+          })
+        }
+      },
+      {
+        getModelConfig: () => ({
+          primary: "claude-sonnet-4.6",
+          sonnet: "claude-sonnet-4.6",
+          haiku: "claude-sonnet-4.6",
+          smallFast: "claude-sonnet-4.6",
+        }),
+        getModelCapabilities: (id) =>
+          id === "claude-sonnet-4.6"
+            ? { reasoning_effort: ["low", "medium", "high"] }
+            : undefined,
+        onTelemetry: (e) => { captured.push(e) },
+      },
+    )
+
+    await request(
+      port,
+      "POST",
+      "/v1/messages",
+      JSON.stringify({
+        model: "claude-sonnet-4.6",
+        max_tokens: 50,
+        messages: [{ role: "user", content: "hi" }],
+        output_config: { effort: "max" },
+      }),
+      { "x-api-key": TEST_NONCE },
+    )
+
+    assert.equal(captured.length, 1)
+    assert.equal(captured[0].requestedEffort, "max")
+    assert.equal(captured[0].sentEffort, "high") // clamped down from max
+    assert.notEqual(
+      captured[0].requestedEffort,
+      captured[0].sentEffort,
+      "clamping should make requestedEffort != sentEffort",
+    )
+    // proxyVersion should always be set on the telemetry event
+    assert.ok(captured[0].proxyVersion, "proxyVersion should be present")
+    assert.match(
+      captured[0].proxyVersion,
+      /^\d+\.\d+\.\d+/,
+      "proxyVersion should look like a semver string",
+    )
+  })
+
+  it("leaves effort fields undefined when output_config is absent", async () => {
+    const captured: TelemetryEvent[] = []
+    const { port } = await setup(
+      (req, res) => {
+        if (req.url === "/chat/completions") {
+          let body = ""
+          req.on("data", (c: Buffer) => { body += c.toString() })
+          req.on("end", () => {
+            res.writeHead(200, { "Content-Type": "application/json" })
+            res.end(JSON.stringify({
+              id: "x", object: "chat.completion", created: 0, model: "claude-sonnet-4.6",
+              choices: [{
+                index: 0,
+                message: { role: "assistant", content: "ok" },
+                finish_reason: "stop",
+              }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }))
+          })
+        }
+      },
+      {
+        getModelCapabilities: () => ({ reasoning_effort: ["low", "medium", "high"] }),
+        onTelemetry: (e) => { captured.push(e) },
+      },
+    )
+
+    await request(
+      port,
+      "POST",
+      "/v1/messages",
+      JSON.stringify({
+        model: "claude-sonnet-4.6",
+        max_tokens: 50,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+      { "x-api-key": TEST_NONCE },
+    )
+
+    assert.equal(captured.length, 1)
+    assert.equal(captured[0].requestedEffort, undefined)
+    assert.equal(captured[0].sentEffort, undefined)
+  })
+
+  // ── Alias resolution end-to-end ──────────────────────────────────────────
+
+  it("rewrites alias in incoming request to real GHCP id upstream", async () => {
+    let receivedBody = ""
+    const { port } = await setup(
+      (req, res) => {
+        if (req.url === "/chat/completions") {
+          let body = ""
+          req.on("data", (c: Buffer) => { body += c.toString() })
+          req.on("end", () => {
+            receivedBody = body
+            res.writeHead(200, { "Content-Type": "application/json" })
+            res.end(JSON.stringify({
+              id: "x", object: "chat.completion", created: 0, model: "claude-opus-4.7-1m-internal",
+              choices: [{
+                index: 0,
+                message: { role: "assistant", content: "ok" },
+                finish_reason: "stop",
+              }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }))
+          })
+        }
+      },
+      {
+        getModelConfig: () => ({
+          primary: "claude-opus-4-7[1m]",
+          sonnet: "claude-opus-4-7[1m]",
+          haiku: "claude-opus-4-7[1m]",
+          smallFast: "claude-opus-4-7[1m]",
+        }),
+        resolveAlias: (alias) =>
+          alias === "claude-opus-4-7" ? "claude-opus-4.7-1m-internal" : undefined,
+      },
+    )
+
+    // Claude Code sends the alias (what's in settings.json env vars).
+    await request(
+      port,
+      "POST",
+      "/v1/messages",
+      JSON.stringify({
+        model: "claude-opus-4-7[1m]",
+        max_tokens: 50,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+      { "x-api-key": TEST_NONCE },
+    )
+
+    const parsed = JSON.parse(receivedBody)
+    // Upstream sees the real GHCP id, not the alias.
+    assert.equal(parsed.model, "claude-opus-4.7-1m-internal")
+  })
+
+  it("looks up capabilities by real id (alias-rewritten) and clamps effort", async () => {
+    let receivedBody = ""
+    const { port } = await setup(
+      (req, res) => {
+        if (req.url === "/chat/completions") {
+          let body = ""
+          req.on("data", (c: Buffer) => { body += c.toString() })
+          req.on("end", () => {
+            receivedBody = body
+            res.writeHead(200, { "Content-Type": "application/json" })
+            res.end(JSON.stringify({
+              id: "x", object: "chat.completion", created: 0, model: "claude-opus-4.7-1m-internal",
+              choices: [{
+                index: 0,
+                message: { role: "assistant", content: "ok" },
+                finish_reason: "stop",
+              }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }))
+          })
+        }
+      },
+      {
+        getModelConfig: () => ({
+          primary: "claude-opus-4-7[1m]",
+          sonnet: "claude-opus-4-7[1m]",
+          haiku: "claude-opus-4-7[1m]",
+          smallFast: "claude-opus-4-7[1m]",
+        }),
+        // Capabilities only known under the REAL id, not the alias.
+        getModelCapabilities: (id) =>
+          id === "claude-opus-4.7-1m-internal"
+            ? { reasoning_effort: ["low", "medium", "high", "xhigh"] }
+            : undefined,
+        resolveAlias: (alias) =>
+          alias === "claude-opus-4-7" ? "claude-opus-4.7-1m-internal" : undefined,
+      },
+    )
+
+    await request(
+      port,
+      "POST",
+      "/v1/messages",
+      JSON.stringify({
+        model: "claude-opus-4-7[1m]",
+        max_tokens: 50,
+        messages: [{ role: "user", content: "hi" }],
+        output_config: { effort: "max" },
+      }),
+      { "x-api-key": TEST_NONCE },
+    )
+
+    const parsed = JSON.parse(receivedBody)
+    assert.equal(parsed.model, "claude-opus-4.7-1m-internal")
+    assert.equal(parsed.reasoning_effort, "xhigh") // clamped from max
+  })
+
+  it("passes through unknown aliases unchanged (no resolver match)", async () => {
+    let receivedBody = ""
+    const { port } = await setup(
+      (req, res) => {
+        if (req.url === "/chat/completions") {
+          let body = ""
+          req.on("data", (c: Buffer) => { body += c.toString() })
+          req.on("end", () => {
+            receivedBody = body
+            res.writeHead(200, { "Content-Type": "application/json" })
+            res.end(JSON.stringify({
+              id: "x", object: "chat.completion", created: 0, model: "gpt-5",
+              choices: [{
+                index: 0,
+                message: { role: "assistant", content: "ok" },
+                finish_reason: "stop",
+              }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }))
+          })
+        }
+      },
+      {
+        resolveAlias: () => undefined,
+      },
+    )
+
+    await request(
+      port,
+      "POST",
+      "/v1/messages",
+      JSON.stringify({
+        model: "gpt-5",
+        max_tokens: 50,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+      { "x-api-key": TEST_NONCE },
+    )
+
+    const parsed = JSON.parse(receivedBody)
+    assert.equal(parsed.model, "gpt-5")
   })
 })

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 
-export const PROXY_CLAUDE_VERSION = "1.3.0"
+export const PROXY_CLAUDE_VERSION = "1.7.0"
 export const UPDATE_CHECK_URL =
   "https://api.github.com/repos/aep-edge-microsoft/proxy-claude/contents/package.json?ref=main"
 

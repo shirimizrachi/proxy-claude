@@ -13,6 +13,7 @@
 3. `docs/REFERENCE-SOURCE.md` — All source code to adapt from (copilot-api project), inlined with adaptation notes
 4. `docs/GAPS.md` — **Critical implementation details** not covered in reference code (SSE parser, singleton, env vars, Windows, error handling)
 5. `docs/GHCP-COMPARISON.md` — Security compliance comparison with official GitHub Copilot extension
+6. `docs/MODEL-ALIASING.md` — **Read before touching any model-id handling.** Explains why proxy-claude rewrites GHCP dot-versioned ids (`claude-opus-4.7-1m-internal`) to Claude Code's dash-canonical form (`claude-opus-4-7`), the collision policy, and the `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT` belt-and-suspenders.
 
 ## Key Constraints
 

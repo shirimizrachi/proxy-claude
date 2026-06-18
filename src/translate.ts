@@ -15,17 +15,130 @@ import type {
   ChatCompletionsPayload,
   ContentPart,
   Message,
+  ModelSupports,
   Tool,
   ToolCall,
 } from "./types.ts"
 
 // ─── Request Translation (Anthropic → OpenAI) ───────────────────────────────
 
+export interface ModelConfig {
+  primary: string
+  sonnet: string
+  haiku: string
+  smallFast: string
+}
+
+// Canonical effort hierarchy, lowest → highest. Used to clamp Claude Code's
+// requested effort into the model-specific set GHCP exposes. Exported so CLI
+// option parsing can validate against the same list (plus the "auto" sentinel).
+export const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"] as const
+
+/**
+ * Clamp a requested effort level into a model's supported set.
+ *
+ * Rules:
+ *   - supported empty/missing → undefined (drop, GHCP uses its default)
+ *   - requested not in canonical hierarchy → undefined (drop)
+ *   - requested in supported → passthrough
+ *   - requested above all supported → highest supported
+ *   - requested below all supported → lowest supported
+ *   - requested falls in a gap (e.g. supported=[low,high], requested=medium)
+ *     → nearest supported, preferring lower (safer/cheaper)
+ *
+ * Unknown levels in the supported list are ignored, not crashed.
+ */
+export function clampEffort(
+  requested: string | undefined,
+  supported: Array<string> | undefined,
+): string | undefined {
+  if (!requested || !supported || supported.length === 0) return undefined
+
+  const reqIdx = EFFORT_ORDER.indexOf(requested as (typeof EFFORT_ORDER)[number])
+  if (reqIdx === -1) return undefined
+
+  if (supported.includes(requested)) return requested
+
+  const ranked = supported
+    .map((s) => [s, EFFORT_ORDER.indexOf(s as (typeof EFFORT_ORDER)[number])] as const)
+    .filter(([, i]) => i !== -1)
+    .sort((a, b) => a[1] - b[1])
+
+  if (ranked.length === 0) return undefined
+
+  const lowest = ranked[0]
+  const highest = ranked[ranked.length - 1]
+
+  if (reqIdx > highest[1]) return highest[0]
+  if (reqIdx < lowest[1]) return lowest[0]
+
+  // Gap case: nearest, prefer lower (matches "no errors / no over-billing" intent).
+  let best = lowest
+  for (const candidate of ranked) {
+    if (candidate[1] <= reqIdx) {
+      best = candidate
+    } else {
+      break
+    }
+  }
+  return best[0]
+}
+
+/**
+ * Apply a minimum effort floor. If the requested effort is below the floor
+ * (or absent), raise it to the floor. If the floor is invalid or unset,
+ * pass through unchanged.
+ *
+ * This runs BEFORE clampEffort — the floor raises the request, then clamping
+ * ensures the result is within the model's supported set.
+ *
+ * Reads from PROXY_CLAUDE_MIN_EFFORT env var (set via --effort CLI or
+ * first-run picker, persisted in ~/.claude/settings.json env block).
+ */
+export function applyEffortFloor(
+  requested: string | undefined,
+  floor: string | undefined,
+): string | undefined {
+  if (!floor) return requested
+  const floorIdx = EFFORT_ORDER.indexOf(floor as (typeof EFFORT_ORDER)[number])
+  if (floorIdx === -1) return requested // invalid floor value, ignore
+
+  if (!requested) return floor // no request → use floor directly
+
+  const reqIdx = EFFORT_ORDER.indexOf(requested as (typeof EFFORT_ORDER)[number])
+  if (reqIdx === -1) return floor // unrecognized request → use floor
+
+  return floorIdx > reqIdx ? floor : requested
+}
+
 export function translateToOpenAI(
   payload: AnthropicMessagesPayload,
+  modelConfig?: ModelConfig,
+  mappedModelCapabilities?: ModelSupports,
+  /**
+   * Pre-resolved real GHCP model id. Pass this when the caller has already
+   * computed the mapping (e.g. server handler that needs the same id for
+   * capability lookup). When omitted, falls back to recomputing via
+   * mapModelToCopilot without alias resolution — which is correct only for
+   * call sites that don't care about aliasing (translate.ts unit tests).
+   */
+  mappedModelOverride?: string,
+  /**
+   * Minimum effort floor. When set, effort below this level is raised to it
+   * before clamping to the model's supported set. Passed explicitly by the
+   * server (from env var) so unit tests aren't affected by ambient env.
+   */
+  effortFloor?: string,
 ): ChatCompletionsPayload {
-  return {
-    model: translateModelName(payload.model),
+  const requestedEffort = payload.output_config?.effort
+  const effectiveEffort = applyEffortFloor(requestedEffort, effortFloor)
+  const reasoningEffort = clampEffort(
+    effectiveEffort,
+    mappedModelCapabilities?.reasoning_effort,
+  )
+
+  const result: ChatCompletionsPayload = {
+    model: mappedModelOverride ?? mapModelToCopilot(payload.model, modelConfig),
     messages: translateAnthropicMessagesToOpenAI(
       payload.messages,
       payload.system,
@@ -39,15 +152,106 @@ export function translateToOpenAI(
     tools: translateAnthropicToolsToOpenAI(payload.tools),
     tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice),
   }
+
+  if (reasoningEffort !== undefined) {
+    result.reasoning_effort = reasoningEffort
+  }
+
+  return result
 }
 
-function translateModelName(model: string): string {
-  if (model.startsWith("claude-sonnet-4-")) {
-    return model.replace(/^claude-sonnet-4-.*/, "claude-sonnet-4")
-  } else if (model.startsWith("claude-opus-4-")) {
-    return model.replace(/^claude-opus-4-.*/, "claude-opus-4")
+/**
+ * Strip the literal trailing "[1m]" bracket suffix that Claude Code uses
+ * client-side as a context-window hint. The "1m" inside a model id
+ * (e.g. "claude-opus-4.7-1m-internal") is preserved.
+ */
+function stripContextHint(model: string): string {
+  return model.replace(/\[1m\]$/, "")
+}
+
+const HAIKU_RE = /claude-(?:\d+[-.]\d+[-.])?haiku/i
+const SONNET_RE = /claude-(?:\d+[-.]\d+[-.])?sonnet/i
+const CLAUDE_RE = /^claude[-.]/i
+
+/**
+ * Given a real GHCP Claude model id (dot-versioned, e.g.
+ * "claude-opus-4.7-1m-internal"), produce a dash-canonical alias that
+ * Claude Code's substring matchers recognize as a Claude model.
+ *
+ * Returns null for ids that aren't dot-versioned Claude families (those are
+ * either already in canonical form, e.g. "claude-opus-4", or aren't Claude at
+ * all, e.g. "gpt-4.1"). In both cases the caller should pass the id through
+ * unchanged.
+ *
+ * The `has1m` flag is derived from the *real id's* suffix segment, never from
+ * the alias string — keeping that flag independent prevents `[1m]` from being
+ * appended twice when the alias itself happens to include "1m" segments.
+ *
+ * Examples:
+ *   "claude-opus-4.7-1m-internal" → { alias: "claude-opus-4-7", has1m: true }
+ *   "claude-opus-4.6-1m"          → { alias: "claude-opus-4-6", has1m: true }
+ *   "claude-opus-4.6"             → { alias: "claude-opus-4-6", has1m: false }
+ *   "claude-sonnet-4.6"           → { alias: "claude-sonnet-4-6", has1m: false }
+ *   "claude-haiku-4.5"            → { alias: "claude-haiku-4-5", has1m: false }
+ *   "gpt-4.1"                     → null
+ *   "claude-opus-4"               → null (no dot in version; already canonical)
+ */
+export function ghcpIdToAlias(realId: string): { alias: string; has1m: boolean } | null {
+  const m = realId.match(/^claude-(opus|sonnet|haiku)-(\d+)\.(\d+)(?:-(.+))?$/i)
+  if (!m) return null
+  const [, family, major, minor, suffix] = m
+  const alias = `claude-${family.toLowerCase()}-${major}-${minor}`
+  const has1m = suffix !== undefined && /(^|[-_.])1m([-_.]|$)/i.test(suffix)
+  return { alias, has1m }
+}
+
+/**
+ * Map incoming Anthropic-style model identifiers to a GHCP model.
+ * Claude Code's agent teams override the env-configured model with hard-coded
+ * tier names ("haiku", "sonnet", "opus") or canonical Anthropic IDs
+ * (e.g. "claude-3-5-haiku-20241022"). GHCP rejects those.
+ *
+ * Tier routing (fallbacks resolved upstream in main.ts):
+ *   - haiku-tier  → smallFast
+ *   - sonnet-tier → sonnet
+ *   - opus / other claude-* → primary
+ *   - non-claude  → unchanged
+ *
+ * On every return path, the resulting id is alias-resolved via `resolveAlias`
+ * (final step). This means model-config tier values can themselves be aliases
+ * (which they will be after configureFirstRun writes the canonical settings
+ * id), and the request handler always ends up with the *real* GHCP id —
+ * never the alias — so capability lookups and the upstream payload stay in
+ * sync.
+ */
+export function mapModelToCopilot(
+  incoming: string,
+  modelConfig?: ModelConfig,
+  resolveAlias?: (alias: string) => string | undefined,
+): string {
+  const resolveFinal = (id: string): string => {
+    const clean = stripContextHint(id)
+    return resolveAlias?.(clean) ?? clean
   }
-  return model
+
+  const clean = stripContextHint(incoming)
+  if (!modelConfig) return resolveFinal(clean)
+
+  const lower = clean.toLowerCase()
+
+  if (lower === "haiku" || HAIKU_RE.test(clean)) {
+    return resolveFinal(modelConfig.smallFast)
+  }
+
+  if (lower === "sonnet" || SONNET_RE.test(clean)) {
+    return resolveFinal(modelConfig.sonnet)
+  }
+
+  if (lower === "opus" || CLAUDE_RE.test(clean)) {
+    return resolveFinal(modelConfig.primary)
+  }
+
+  return resolveFinal(clean)
 }
 
 function translateAnthropicMessagesToOpenAI(
@@ -62,7 +266,78 @@ function translateAnthropicMessagesToOpenAI(
       : handleAssistantMessage(message),
   )
 
+  // GHCP-side validation on some Claude models (notably opus-4.8) rejects
+  // requests where the final assistant message content ends with whitespace
+  // with: 400 "final assistant content cannot end with trailing whitespace".
+  // Anthropic's own API has the same rule. Right-trim the last assistant
+  // message to make the request universally acceptable.
+  trimFinalAssistantWhitespace(otherMessages)
+
+  // GHCP-side validation on opus-4.8 (and likely other newer Claude models
+  // surfaced through GHCP) also rejects requests whose final message is an
+  // assistant message with: 400 "This model does not support assistant
+  // message prefill. The conversation must end with a user message."
+  // Anthropic's native API accepts a trailing assistant message as a prefill
+  // hint; GHCP does not. Claude Code occasionally produces conversations
+  // ending in an assistant message (e.g. after an interrupted turn). Append
+  // a synthetic "continue" user message so the request is universally
+  // acceptable. On models that *do* support prefill, this changes behavior
+  // from "continue the assistant text" to "respond to a continue prompt" —
+  // which matches what Claude Code actually wants in this scenario.
+  ensureConversationEndsWithUser(otherMessages)
+
   return [...systemMessages, ...otherMessages]
+}
+
+/**
+ * If the final message in the conversation is an assistant message, append a
+ * synthetic user message asking it to continue. GHCP's opus-4.8 rejects
+ * trailing assistant messages outright; this guards against that.
+ *
+ * Tool messages (role="tool") are also acceptable terminators in
+ * OpenAI/GHCP land — they represent tool results that the model is expected
+ * to react to, so we leave those alone.
+ */
+function ensureConversationEndsWithUser(messages: Array<Message>): void {
+  if (messages.length === 0) return
+  const last = messages[messages.length - 1]
+  if (last.role !== "assistant") return
+  messages.push({
+    role: "user",
+    content: "Please continue.",
+  })
+}
+
+/**
+ * Walk messages from the end; if the last message is an assistant message
+ * with string content, right-trim it. Tool-use messages and tool messages
+ * aren't affected (they don't carry user-visible trailing whitespace).
+ * Array content (multi-modal) is also normalized: the last text part is
+ * right-trimmed.
+ */
+function trimFinalAssistantWhitespace(messages: Array<Message>): void {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role !== "assistant") continue
+    if (typeof m.content === "string") {
+      m.content = m.content.replace(/\s+$/, "")
+      // If trimming made content empty AND the message has tool_calls,
+      // null is the OpenAI convention. Otherwise keep empty string.
+      if (m.content === "" && m.tool_calls && m.tool_calls.length > 0) {
+        m.content = null as unknown as string
+      }
+    } else if (Array.isArray(m.content)) {
+      // Find the last text part and trim it.
+      for (let j = m.content.length - 1; j >= 0; j--) {
+        const part = m.content[j]
+        if (part.type === "text") {
+          part.text = part.text.replace(/\s+$/, "")
+          break
+        }
+      }
+    }
+    return // only the last assistant message matters
+  }
 }
 
 function handleSystemPrompt(

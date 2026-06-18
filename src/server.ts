@@ -3,7 +3,8 @@ import { randomUUID, timingSafeEqual } from "node:crypto"
 
 import { logToFile, formatError } from "./log.ts"
 import { createChatCompletions, CopilotApiError, parseSSE } from "./copilot.ts"
-import { translateToOpenAI, translateToAnthropic, translateOpenAIErrorToAnthropic } from "./translate.ts"
+import { translateToOpenAI, translateToAnthropic, translateOpenAIErrorToAnthropic, mapModelToCopilot } from "./translate.ts"
+import type { ModelConfig } from "./translate.ts"
 import {
   translateChunkToAnthropicEvents,
   translateErrorToAnthropicErrorEvent,
@@ -15,6 +16,7 @@ import type {
   ChatCompletionChunk,
   ChatCompletionResponse,
   CopilotResponseMeta,
+  ModelSupports,
   TelemetryEvent,
 } from "./types.ts"
 
@@ -74,17 +76,49 @@ function isAuthValid(
   return false
 }
 
+export interface StartServerOptions {
+  port: number
+  nonce: string
+  getCopilotToken: () => string
+  getCopilotBaseUrl: () => string
+  getModel?: () => string
+  onTelemetry?: (event: TelemetryEvent) => void
+  getUsername?: () => string
+  refreshToken?: () => Promise<boolean>
+  isTokenHealthy?: () => boolean
+  getModelConfig?: () => ModelConfig
+  /**
+   * Look up GHCP model capabilities by *real* GHCP model id (i.e. the id
+   * after mapModelToCopilot resolves both the Claude Code tier and any
+   * alias). Returns undefined for unknown models, in which case effort and
+   * other capability-gated fields are silently dropped.
+   */
+  getModelCapabilities?: (mappedModelId: string) => ModelSupports | undefined
+  /**
+   * Resolve a Claude-Code-recognizable alias (e.g. "claude-opus-4-7") to the
+   * real GHCP id (e.g. "claude-opus-4.7-1m-internal"). Returns undefined for
+   * unknown aliases; mapModelToCopilot then passes the id through unchanged.
+   */
+  resolveAlias?: (alias: string) => string | undefined
+}
+
 export function startServer(
-  port: number,
-  nonce: string,
-  getCopilotToken: () => string,
-  getCopilotBaseUrl: () => string,
-  getModel?: () => string,
-  onTelemetry?: (event: TelemetryEvent) => void,
-  getUsername?: () => string,
-  refreshToken?: () => Promise<boolean>,
-  isTokenHealthy?: () => boolean,
+  options: StartServerOptions,
 ): Promise<{ server: http.Server; port: number }> {
+  const {
+    port,
+    nonce,
+    getCopilotToken,
+    getCopilotBaseUrl,
+    getModel,
+    onTelemetry,
+    getUsername,
+    refreshToken,
+    isTokenHealthy,
+    getModelConfig,
+    getModelCapabilities,
+    resolveAlias,
+  } = options
   const serverStartTime = Date.now()
 
   // In-memory session stats for /v1/stats endpoint
@@ -235,12 +269,47 @@ export function startServer(
       try {
         const bodyStr = await readBody(req)
         const anthropicPayload = JSON.parse(bodyStr) as AnthropicMessagesPayload
-        const openAIPayload = translateToOpenAI(anthropicPayload)
+        const modelConfig = getModelConfig?.()
+        // Single authoritative mapping path: resolves Claude Code tier names,
+        // strips [1m] hint, and resolves alias to the real GHCP id. Used as
+        // the key for BOTH capability lookup and the outgoing payload to
+        // keep them aligned.
+        const mappedModel = mapModelToCopilot(
+          anthropicPayload.model,
+          modelConfig,
+          resolveAlias,
+        )
+        const mappedCapabilities = getModelCapabilities?.(mappedModel)
+        const effortFloor = process.env.PROXY_CLAUDE_MIN_EFFORT || undefined
+        const openAIPayload = translateToOpenAI(
+          anthropicPayload,
+          modelConfig,
+          mappedCapabilities,
+          mappedModel,
+          effortFloor,
+        )
 
-        // Capture request metadata for telemetry
+        // Capture request metadata for telemetry (declared early so the debug
+        // log can reuse them; error-path telemetry events leave these fields
+        // undefined, matching the existing pattern for other fields).
         const messageCount = anthropicPayload.messages.length
         const toolCount = anthropicPayload.tools?.length ?? 0
         const hasThinking = anthropicPayload.thinking?.type === "enabled"
+        const requestedEffort = anthropicPayload.output_config?.effort
+        const sentEffort = openAIPayload.reasoning_effort ?? undefined
+
+        if (process.env.PROXY_CLAUDE_DEBUG === "1") {
+          if (modelConfig && mappedModel !== anthropicPayload.model) {
+            console.error(`[proxyClaude] model: ${anthropicPayload.model} → ${mappedModel}`)
+          }
+          if (requestedEffort !== undefined || sentEffort !== undefined) {
+            const supported = mappedCapabilities?.reasoning_effort
+            const floor = effortFloor ?? "none"
+            console.error(
+              `[proxyClaude] effort: requested=${requestedEffort ?? "none"} floor=${floor} sent=${sentEffort ?? "none"} supported=${supported ? JSON.stringify(supported) : "unknown"}`,
+            )
+          }
+        }
 
         // Helper: attempt the Copilot API call, with one retry on 401 after token refresh
         const callCopilot = async (): Promise<{ response: Response; meta: CopilotResponseMeta }> => {
@@ -283,6 +352,8 @@ export function startServer(
                 messageCount,
                 toolCount,
                 hasThinking,
+                requestedEffort,
+                sentEffort,
                 inputTokens: usage.input_tokens,
                 outputTokens: usage.output_tokens,
                 cacheReadTokens: usage.cache_read_input_tokens ?? 0,
@@ -419,6 +490,8 @@ export function startServer(
                 messageCount,
                 toolCount,
                 hasThinking,
+                requestedEffort,
+                sentEffort,
                 inputTokens: streamUsage.inputTokens,
                 outputTokens: streamUsage.outputTokens,
                 cacheReadTokens: streamUsage.cacheReadTokens,

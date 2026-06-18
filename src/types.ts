@@ -19,8 +19,11 @@ export interface AnthropicMessagesPayload {
     name?: string
   }
   thinking?: {
-    type: "enabled"
+    type: "enabled" | "adaptive"
     budget_tokens?: number
+  }
+  output_config?: {
+    effort?: string
   }
   service_tier?: "auto" | "standard_only"
 }
@@ -301,6 +304,7 @@ export interface ChatCompletionsPayload {
     | { type: "function"; function: { name: string } }
     | null
   user?: string | null
+  reasoning_effort?: string | null
 }
 
 export interface Tool {
@@ -363,6 +367,13 @@ export interface ModelSupports {
   tool_calls?: boolean
   parallel_tool_calls?: boolean
   dimensions?: boolean
+  streaming?: boolean
+  structured_outputs?: boolean
+  vision?: boolean
+  reasoning_effort?: Array<string>
+  adaptive_thinking?: boolean
+  max_thinking_budget?: number
+  min_thinking_budget?: number
 }
 
 export interface ModelCapabilities {
@@ -424,7 +435,21 @@ export interface CopilotTokenResponse {
 export interface CliOptions {
   useAgency: boolean
   resetModels: boolean
+  effort?: string
   passthroughArgs: string[]
+}
+
+/**
+ * On-disk persistence of the alias → real-GHCP-id map.
+ * Saved after every successful /models fetch so that subsequent runs can
+ * resolve aliases even when /models is temporarily unavailable.
+ */
+export interface ModelAliasFile {
+  version: 1
+  savedAt: number
+  /** Map from Claude-Code-recognizable alias (e.g. "claude-opus-4-7") to
+   *  the real GHCP model id (e.g. "claude-opus-4.7-1m-internal"). */
+  aliases: Record<string, string>
 }
 
 // ─── Telemetry Types ──────────────────────────────────────────────────────────
@@ -443,6 +468,16 @@ export interface TelemetryEvent {
   messageCount: number
   toolCount: number
   hasThinking: boolean
+
+  /** proxy-claude version that produced this event (from PROXY_CLAUDE_VERSION). */
+  proxyVersion: string
+
+  // Effort (output_config.effort) — present only when Claude Code sent one.
+  // requestedEffort is the raw user intent; sentEffort is what we forwarded to
+  // GHCP after clamping against the model's supported set. When they differ,
+  // clamping kicked in.
+  requestedEffort?: string
+  sentEffort?: string
 
   // Response metadata
   inputTokens: number

@@ -323,6 +323,12 @@ Anthropic: event: content_block_delta
 
 The translation logic is ported from `copilot-api`, which has been tested and is in production use.
 
+### Model id aliasing
+
+GHCP uses non-standard dot-versioned Claude ids (`claude-opus-4.7-1m-internal`) that break Claude Code's dash-substring matchers (effort, display name, adaptive thinking). The proxy rewrites the id to the dash-canonical form (`claude-opus-4-7`) before Claude Code sees it, and resolves it back to the real GHCP id before forwarding upstream.
+
+See **[docs/MODEL-ALIASING.md](./MODEL-ALIASING.md)** for the full rationale, alias rule, collision policy, and end-to-end flow.
+
 ---
 
 ## Reference Implementation

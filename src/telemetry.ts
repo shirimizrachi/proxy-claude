@@ -8,6 +8,7 @@ import {
   APPINSIGHTS_INGESTION_ENDPOINT,
   MODEL_PRICING,
   DEFAULT_PRICING,
+  PROXY_CLAUDE_VERSION,
 } from "./constants.ts"
 import { logToFile } from "./log.ts"
 import type { TelemetryEvent, TelemetryContext, ModelPricing } from "./types.ts"
@@ -104,6 +105,8 @@ export function buildTelemetryEvent(params: {
   messageCount: number
   toolCount: number
   hasThinking: boolean
+  requestedEffort?: string
+  sentEffort?: string
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number
@@ -129,6 +132,9 @@ export function buildTelemetryEvent(params: {
     messageCount: params.messageCount,
     toolCount: params.toolCount,
     hasThinking: params.hasThinking,
+    proxyVersion: PROXY_CLAUDE_VERSION,
+    requestedEffort: params.requestedEffort,
+    sentEffort: params.sentEffort,
     inputTokens: params.inputTokens,
     outputTokens: params.outputTokens,
     cacheReadTokens: params.cacheReadTokens,
@@ -261,6 +267,14 @@ export function createTelemetryClient(context: TelemetryContext) {
               dayOfWeek: e.dayOfWeek,
               hourOfDay: String(e.hourOfDay),
               hasThinking: String(e.hasThinking),
+              proxyVersion: e.proxyVersion,
+              requestedEffort: e.requestedEffort ?? "",
+              sentEffort: e.sentEffort ?? "",
+              effortClamped: String(
+                e.requestedEffort !== undefined &&
+                e.sentEffort !== undefined &&
+                e.requestedEffort !== e.sentEffort,
+              ),
               copilotSku: context.copilotSku ?? "",
               copilotApiUrl: e.copilotApiUrl ?? "",
               copilotRequestId: e.copilotRequestId ?? "",

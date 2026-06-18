@@ -2,13 +2,13 @@
 
 > **Use [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with your GitHub Copilot license — no Anthropic subscription needed.**
 
-proxy-claude is a local proxy that connects Claude Code to the GitHub Copilot API — using **the same architectural patterns** as GitHub Copilot's official Claude Code integration in VS Code ([`ClaudeLanguageModelServer`](https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/agents/claude/node/claudeLanguageModelServer.ts)):
+proxy-claude is a local proxy that connects Claude Code to the GitHub Copilot API — using **the same architectural patterns** as GitHub Copilot's official Claude Code integration in VS Code ([`ClaudeLanguageModelTool`](https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/agents/claude/node/claudeLanguageModelTool.ts)):
 
-- Local HTTP server on `127.0.0.1` accepting Anthropic Messages API requests ([same as GHCP](https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/agents/claude/node/claudeLanguageModelServer.ts#L303))
-- Nonce-based authentication via `x-api-key` / `Authorization: Bearer` headers ([same dual-header validation](https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/agents/claude/node/claudeLanguageModelServer.ts#L126))
-- `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` env vars passed to Claude Code ([same as GHCP terminal mode](https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/agents/claude/vscode-node/slashCommands/terminalCommand.ts#L87))
+- Local HTTP server on `127.0.0.1` accepting Anthropic Messages API requests ([same as GHCP](https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/agents/claude/node/claudeCodeServer.ts))
+- Nonce-based authentication via `x-api-key` / `Authorization: Bearer` headers ([same dual-header validation](https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/agents/claude/node/claudeCodeServer.ts))
+- `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` env vars passed to Claude Code ([same as GHCP terminal mode](https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/agents/claude/vscode-node/claudeCodePlatform.ts))
 
-The one difference: GHCP accesses Copilot's native Messages API via the internal `@vscode/copilot-api` SDK. Since we're standalone, we translate Anthropic ↔ OpenAI format and route through the public Copilot Chat Completions endpoint instead. The end result for Claude Code is identical.
+The one difference: GHCP accesses Copilot's native Messages API via the internal `@vscode/copilot-api` SDK. Since we're standalone, we translate Anthropic ↔ OpenAI format and route through the public Copilot Chat Completions API.
 
 See [`docs/GHCP-COMPARISON.md`](docs/GHCP-COMPARISON.md) for the full pattern-by-pattern compliance comparison.
 
@@ -26,22 +26,18 @@ See [`docs/GHCP-COMPARISON.md`](docs/GHCP-COMPARISON.md) for the full pattern-by
 
 ## Quick Start
 
-### Option 1: Run directly with npx (no clone needed)
+> **Note:** `proxy-claude` is not currently published to npm, so `npx proxy-claude` from an arbitrary directory is not supported. Clone the repository first.
+
+### Option 1: Run from a clone
 
 ```bash
-npx proxy-claude
-```
-
-### Option 2: Run from a clone
-
-```bash
-git clone https://github.com/assafakiva_microsoft/proxy-claude.git
+git clone https://github.com/aep-edge-microsoft/proxy-claude.git
 cd proxy-claude
 npm install      # also builds automatically via the `prepare` script
 npx proxy-claude
 ```
 
-### Option 3: Install globally (run from anywhere)
+### Option 2: Install globally (run from anywhere)
 
 ```bash
 # From inside the cloned repo:
@@ -66,22 +62,23 @@ On subsequent runs, your GitHub token and model choices are remembered — it st
 ## Usage
 
 ```bash
-proxy-claude [--agency] [--yolo] [--reset-models] [-- <args...>]
+proxy-claude [--agency[=true|false|no]] [--yolo] [--reset-models] [-- <args...>]
 proxy-claude update
 ```
 
 | Flag / Command | Description |
 |---|---|
-| *(no flags)* | Start proxy and launch Claude Code |
+| *(no flags)* | Start proxy and launch Claude Code via Agency by default (falls back to direct `claude` if Agency is unavailable) |
 | `update` | Check for and install the latest version (like `claude update`) |
-| `--agency` | Launch via the [Agency](https://eng.ms/docs/coreai/devdiv/one-engineering-system-1es/1es-jacekcz/startrightgitops/agency/usingagency) CLI instead of `claude` directly. Extra args can be passed after `--` (e.g. `proxy-claude --agency -- --some-flag`) |
+| `--agency` | Keep compatibility with explicit Agency runtime selection |
+| `--agency no` / `--agency false` | Disable Agency runtime and launch `claude` directly |
 | `--yolo` | ⚠️ **DANGER** — Launch Claude Code in YOLO mode (`--dangerously-skip-permissions`) — Claude will execute tools **without asking for confirmation**. Use at your own risk! |
 | `--reset-models` | Clear saved model selection and re-prompt on next run |
 
 ### Examples
 
 ```bash
-# Normal launch
+# Normal launch (Agency by default; auto-fallbacks if Agency is not installed)
 proxy-claude
 
 # Update to latest version
@@ -89,6 +86,9 @@ proxy-claude update
 
 # Launch via Agency CLI
 proxy-claude --agency
+
+# Disable Agency runtime explicitly
+proxy-claude --agency false
 
 # Agency with passthrough args
 proxy-claude --agency -- --some-flag
@@ -259,7 +259,7 @@ src/
 
 ## Acknowledgments
 
-The translation layer, auth flow, and API client are adapted from [copilot-api](https://github.com/nicepkg/copilot-api) (MIT License) by nicepkg contributors. See `docs/REFERENCE-SOURCE.md` for the original reference code and adaptation notes.
+The translation layer, auth flow, and API client are adapted from [copilot-api](https://github.com/nicepkg/copilot-api) (MIT License) by nicepkg contributors. See `docs/REFERENCE-SOURCE.md` for the annotated reference source.
 
 ---
 

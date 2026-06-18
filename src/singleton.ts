@@ -9,7 +9,7 @@ const LOCK_DIR = path.join(os.homedir(), ".proxy-claude")
 const LOCK_FILE = path.join(LOCK_DIR, "server.lock")
 
 // Bump this when server changes require a restart (e.g. new route handling)
-const SERVER_VERSION = "3"
+const SERVER_VERSION = "6"
 
 export function getServerVersion(): string {
   return SERVER_VERSION

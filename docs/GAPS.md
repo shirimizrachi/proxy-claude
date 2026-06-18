@@ -587,3 +587,17 @@ if (!response.ok) {
   return;
 }
 ```
+
+---
+
+## Gap 11: Claude Code's Substring Matching on Model IDs
+
+Claude Code makes capability decisions (`modelSupportsEffort`, `getPublicModelName`, `modelSupportsAdaptiveThinking`, etc.) via **case-insensitive substring matching** on dash-separated canonical Anthropic ids (`claude-opus-4-6`). GHCP uses **dot-separated** ids (`claude-opus-4.6-1m`, `claude-opus-4.7-1m-internal`), so every one of those matchers misses by default.
+
+Concrete consequence: the effort passthrough is dead code for GHCP-internal Claude models; the `/model` picker labels Opus 4.6/4.7 as plain "Opus 4".
+
+**Solution lives in [docs/MODEL-ALIASING.md](./MODEL-ALIASING.md)** — the proxy rewrites real GHCP ids to their dash-canonical alias before writing them into `~/.claude/settings.json`, resolves the alias back to the real id on every request, and persists the alias map to `~/.proxy-claude/model-aliases.json` so it survives `/models` fetch failures.
+
+The doc also covers the collision policy (prefer 1M-context variant when multiple real ids map to the same alias), the `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1` belt-and-suspenders, and the migration story for existing users.
+
+**If you're touching anything in `src/translate.ts`'s `mapModelToCopilot`, `src/config.ts`'s `configureFirstRun` / `buildAliasMaps` / `realIdToSettingsId`, or `src/main.ts`'s alias-map wiring, read MODEL-ALIASING.md first.**
